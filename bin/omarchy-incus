@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+#
+# omarchy-incus — install Omarchy into an Incus VM from a downloaded ISO and
+# publish the result as a reusable Incus image.
+#
+# Pipeline (run the steps in order):
+#   omarchy-incus download <url|path>   # fetch (or import) the Omarchy ISO
+#   omarchy-incus install               # boot the ISO in a VM, run the installer
+#   omarchy-incus publish               # turn the installed VM into an image
+#   omarchy-incus spawn <name>          # create a new VM from that image
+#   omarchy-incus clean                 # delete the builder VM
+#
+# The Omarchy ISO is an OFFLINE installer that ends in an interactive TUI
+# (the gum "configurator") and boots into a graphical Hyprland desktop, so the
+# install step is driven by hand over a graphical (SPICE/VGA) console — there
+# is no unattended path without rebuilding the ISO.
+#
+# Get the download link from https://omarchy.org (pass it to `download`, or set
+# OMARCHY_ISO_URL). Everything is overridable via the env vars below.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration (override via environment)
+# ---------------------------------------------------------------------------
+ISO_DIR="${OMARCHY_ISO_DIR:-$HOME/.cache/omarchy}"
+ISO_PATH="${OMARCHY_ISO_PATH:-$ISO_DIR/omarchy.iso}"
+ISO_URL="${OMARCHY_ISO_URL:-}"            # used by `download` when no arg is given
+ISO_SHA256="${OMARCHY_ISO_SHA256:-}"      # optional; verified after download
+
+VM_NAME="${OMARCHY_VM_NAME:-omarchy-builder}"
+IMAGE_ALIAS="${OMARCHY_IMAGE_ALIAS:-omarchy}"
+CPUS="${OMARCHY_VM_CPUS:-4}"
+MEMORY="${OMARCHY_VM_MEMORY:-8GiB}"
+DISK_SIZE="${OMARCHY_VM_DISK:-64GiB}"
+STORAGE_POOL="${OMARCHY_VM_POOL:-}"       # empty = use the default profile's pool
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+SELF="$(basename "$0")"
+
+log()  { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+vm_exists()    { incus info "$VM_NAME" >/dev/null 2>&1; }
+vm_state()     { incus list "$VM_NAME" -f csv -c s 2>/dev/null; }
+image_exists() { incus image info "$IMAGE_ALIAS" >/dev/null 2>&1; }
+
+vm_stop_if_running() {
+  [[ "$(vm_state)" == "RUNNING" ]] && { log "Stopping VM '$VM_NAME'..."; incus stop --force "$VM_NAME"; }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# download — fetch the ISO (or import a local file) into $ISO_PATH
+# ---------------------------------------------------------------------------
+cmd_download() {
+  need curl
+  local src="${1:-$ISO_URL}"
+  [[ -n "$src" ]] || die "No ISO source. Usage: $SELF download <url|path> (or set OMARCHY_ISO_URL). Get the link from https://omarchy.org"
+
+  mkdir -p "$ISO_DIR"
+
+  if [[ -f "$src" ]]; then
+    log "Importing local ISO: $src"
+    cp --reflink=auto -f "$src" "$ISO_PATH"
+  else
+    log "Downloading ISO from: $src"
+    curl -fL -C - --retry 3 --progress-bar -o "$ISO_PATH" "$src"
+  fi
+
+  if [[ -n "$ISO_SHA256" ]]; then
+    log "Verifying SHA256..."
+    echo "$ISO_SHA256  $ISO_PATH" | sha256sum -c - || die "Checksum mismatch"
+  else
+    warn "No OMARCHY_ISO_SHA256 set — skipping integrity check."
+  fi
+
+  log "ISO ready: $ISO_PATH ($(du -h "$ISO_PATH" | cut -f1))"
+}
+
+# ---------------------------------------------------------------------------
+# install — create a VM, boot the ISO, let the user run the installer
+# ---------------------------------------------------------------------------
+cmd_install() {
+  need incus
+  [[ -f "$ISO_PATH" ]] || die "ISO not found at $ISO_PATH — run: $SELF download <url|path>"
+
+  command -v remote-viewer >/dev/null 2>&1 || command -v spicy >/dev/null 2>&1 || \
+    warn "No SPICE client (virt-viewer/spicy) found. 'incus console --type=vga' needs one to show the installer."
+
+  if vm_exists; then
+    read -rp "Builder VM '$VM_NAME' already exists. Delete and recreate? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || die "Aborted."
+    incus delete --force "$VM_NAME"
+  fi
+
+  log "Creating VM '$VM_NAME' (UEFI, Secure Boot OFF, ${CPUS} vCPU, ${MEMORY} RAM, ${DISK_SIZE} disk)..."
+  local init_args=( "$VM_NAME" --vm --empty
+    -c security.secureboot=false
+    -c limits.cpu="$CPUS"
+    -c limits.memory="$MEMORY" )
+  if [[ -n "$STORAGE_POOL" ]]; then
+    init_args+=( -d root,pool="$STORAGE_POOL",size="$DISK_SIZE" )
+  else
+    init_args+=( -d root,size="$DISK_SIZE" )
+  fi
+  incus init "${init_args[@]}"
+
+  log "Attaching installer ISO (boots before the empty disk)..."
+  incus config device add "$VM_NAME" installer disk \
+    source="$(realpath "$ISO_PATH")" boot.priority=10
+
+  log "Starting VM..."
+  incus start "$VM_NAME"
+
+  cat <<EOF
+
+  ──────────────────────────────────────────────────────────────────────────
+  A graphical console will open. Work through the Omarchy installer there:
+
+    • Pick keyboard / user / hostname / timezone as usual.
+    • For a REUSABLE base image, choose an UNENCRYPTED install
+      (press Ctrl+C at the disk-overwrite prompt to toggle off encryption).
+      Cloning a LUKS-encrypted disk into many VMs shares one key and forces a
+      passphrase at every boot — not what you want for a template.
+    • Select the virtio disk (e.g. /dev/sda) as the install target.
+
+  When the install finishes it REBOOTS back to the installer welcome screen
+  (because the ISO is still the boot device). That is your "done" signal:
+  close the console window and answer the prompt below.
+  ──────────────────────────────────────────────────────────────────────────
+
+EOF
+  read -rp "Press Enter to open the console... "
+
+  while true; do
+    incus console "$VM_NAME" --type=vga || true
+    read -rp "Installer finished and rebooted to the welcome screen? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] && break
+    log "Reopening console (Ctrl+C to abort)..."
+  done
+
+  log "Detaching installer ISO and stopping VM..."
+  vm_stop_if_running
+  incus config device remove "$VM_NAME" installer
+
+  read -rp "Boot the installed system once to verify before publishing? [y/N] " ans
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    incus start "$VM_NAME"
+    log "Opening desktop — log in, confirm it works, then close the console."
+    incus console "$VM_NAME" --type=vga || true
+    vm_stop_if_running
+  fi
+
+  log "Install complete. Next: $SELF publish"
+}
+
+# ---------------------------------------------------------------------------
+# publish — snapshot the installed VM into a reusable image
+# ---------------------------------------------------------------------------
+cmd_publish() {
+  need incus
+  vm_exists || die "Builder VM '$VM_NAME' not found — run: $SELF install"
+
+  vm_stop_if_running
+
+  if image_exists; then
+    log "Replacing existing image alias '$IMAGE_ALIAS'..."
+    incus image delete "$IMAGE_ALIAS"
+  fi
+
+  log "Publishing '$VM_NAME' as image '$IMAGE_ALIAS' (this can take a few minutes)..."
+  incus publish "$VM_NAME" --alias "$IMAGE_ALIAS" --compression zstd \
+    description="Omarchy base image (built $(date +%Y-%m-%d))"
+
+  log "Image '$IMAGE_ALIAS' created:"
+  incus image info "$IMAGE_ALIAS" | sed 's/^/    /'
+  log "Spawn a VM from it with:  $SELF spawn my-omarchy"
+}
+
+# ---------------------------------------------------------------------------
+# spawn — create a fresh VM from the published image
+# ---------------------------------------------------------------------------
+cmd_spawn() {
+  need incus
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Usage: $SELF spawn <name>"
+  image_exists || die "Image '$IMAGE_ALIAS' not found — run: $SELF publish"
+
+  # Secure Boot must stay OFF: the installed Limine bootloader is unsigned.
+  log "Creating VM '$name' from image '$IMAGE_ALIAS'..."
+  incus init "$IMAGE_ALIAS" "$name" --vm -c security.secureboot=false
+  incus start "$name"
+  log "Started '$name'. Open the desktop with: incus console $name --type=vga"
+}
+
+# ---------------------------------------------------------------------------
+# clean — remove the builder VM (keeps the published image)
+# ---------------------------------------------------------------------------
+cmd_clean() {
+  need incus
+  if vm_exists; then
+    incus delete --force "$VM_NAME"
+    log "Deleted builder VM '$VM_NAME'."
+  else
+    log "No builder VM to delete."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+$SELF — install Omarchy into an Incus VM and publish a reusable image
+
+USAGE
+  $SELF download <url|path>   Download (or import) the Omarchy ISO
+  $SELF install               Create a VM and run the installer (interactive)
+  $SELF publish               Publish the installed VM as image '$IMAGE_ALIAS'
+  $SELF spawn <name>          Create a new VM from the published image
+  $SELF clean                 Delete the builder VM
+  $SELF help                  Show this help
+
+WORKFLOW
+  Run the steps in order. The Omarchy ISO is a self-contained OFFLINE installer
+  (every package is baked in), so no internet is needed during install.
+
+    1. download   Get the ISO link from https://omarchy.org and pass it:
+                    $SELF download https://.../omarchy.iso
+                  Set OMARCHY_ISO_SHA256 to verify integrity. A local file is
+                  imported instead of downloaded.
+
+    2. install    Creates an empty UEFI VM (Secure Boot off), attaches the ISO
+                  as a boot CD, and opens a graphical console. Work through the
+                  installer there (see NOTES). When done it reboots back to the
+                  welcome screen; close the console and confirm. The ISO is then
+                  detached and the VM stopped.
+
+    3. publish    Snapshots the stopped builder VM into the image '$IMAGE_ALIAS'.
+
+    4. spawn      '$SELF spawn web1' clones a fresh VM from that image.
+
+NOTES
+  * Interactive by design. The configurator is a TUI that autostarts only on
+    tty1 and ends in a graphical desktop, so it must be driven over a VGA/SPICE
+    console (needs virt-viewer or spicy). A hands-free install would require
+    rebuilding the ISO with pre-seeded answers.
+
+  * Secure Boot stays OFF everywhere. The archiso is not shim-signed and the
+    installed Limine bootloader is unsigned, so the builder VM and every
+    spawned VM set security.secureboot=false ('spawn' does this for you).
+
+  * Choose an UNENCRYPTED install for a base image (Ctrl+C toggles encryption
+    off at the disk-overwrite prompt). A cloned LUKS disk shares one key across
+    all VMs and demands a passphrase at every boot.
+
+  * The reboot is the "done" signal. After the install finishes the VM reboots;
+    because the ISO still has boot priority it returns to the welcome screen.
+    That is when you close the console and answer the prompt.
+
+  * Clones share identity. VMs spawned from the image inherit the hostname,
+    username, and password set during the configurator. Re-key/rename per VM
+    if you need uniqueness.
+
+ENV VARS (defaults)
+  OMARCHY_ISO_URL        ISO download link (from https://omarchy.org)
+  OMARCHY_ISO_SHA256     expected ISO checksum (optional but recommended)
+  OMARCHY_ISO_PATH       $ISO_PATH
+  OMARCHY_VM_NAME        $VM_NAME
+  OMARCHY_IMAGE_ALIAS    $IMAGE_ALIAS
+  OMARCHY_VM_CPUS        $CPUS
+  OMARCHY_VM_MEMORY      $MEMORY
+  OMARCHY_VM_DISK        $DISK_SIZE
+  OMARCHY_VM_POOL        (default profile's storage pool)
+EOF
+}
+
+main() {
+  local sub="${1:-}"
+  [[ $# -gt 0 ]] && shift || true
+  case "$sub" in
+    download) cmd_download "$@" ;;
+    install)  cmd_install "$@" ;;
+    publish)  cmd_publish "$@" ;;
+    spawn)    cmd_spawn "$@" ;;
+    clean)    cmd_clean "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) usage; die "Unknown command: $sub" ;;
+  esac
+}
+
+main "$@"
